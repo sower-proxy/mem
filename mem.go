@@ -1,139 +1,107 @@
 package mem
 
 import (
-	"errors"
-	"reflect"
 	"sync"
 	"time"
-
-	"github.com/ulule/deepcopier"
 )
 
-// Data define the type which can speed up by mem cache
-type Data interface {
-	Fulfill(key string) (err error)
+type Cache[K comparable, V any] struct {
+	getter         func(key K) (V, error)
+	RotateInterval time.Duration
+	ExpireInterval time.Duration
+	MaxEntries     int
+
+	list    List[K]
+	syncMap sync.Map
 }
 
-// Cache is the definition of cache, be careful of the memory usage
-type Cache struct {
-	old     *sync.Map
-	now     *sync.Map
-	barrier *sync.Map
-	rotate  <-chan time.Time
-	rwmutex *sync.RWMutex
-}
+func NewCache[K comparable, V any](expire time.Duration,
+	getter func(key K) (V, error)) *Cache[K, V] {
 
-// DefaultCache is default cache for surge
-var DefaultCache = New(time.Minute)
-
-// Remember is a surge, it provides a quite simple way to use cache
-func Remember(dst Data, key string) error {
-	return DefaultCache.Remember(dst, key)
-}
-
-// Delete is a surge, it delete a specified data in DefaultCache
-func Delete(dst Data, key string) {
-	DefaultCache.Delete(dst, key)
-}
-
-// New create a cache entity with a custom expiration time
-func New(rotateInterval time.Duration) *Cache {
-	return &Cache{
-		old:     &sync.Map{},
-		now:     &sync.Map{},
-		barrier: &sync.Map{},
-		rotate:  time.NewTicker(rotateInterval).C,
-		rwmutex: &sync.RWMutex{},
+	return &Cache[K, V]{
+		getter:         getter,
+		RotateInterval: expire / 2,
+		ExpireInterval: expire,
+		MaxEntries:     1000,
 	}
 }
 
-// Remember automatically save and retrieve data from a cache entity
-func (c *Cache) Remember(dst Data, key string) error {
-	rv := reflect.ValueOf(dst)
-	if rv.Kind() != reflect.Ptr {
-		panic("invalid not pointor type: " + reflect.TypeOf(dst).Name())
-	} else if rv.IsNil() {
-		return errors.New("invalid nil pointor")
-	}
+type entry[V any] struct {
+	value V
+	err   error
 
-	c.rwmutex.RLock()
-	defer c.rwmutex.RUnlock()
+	rotateAt time.Time
+	expireAt time.Time
+	rw       sync.RWMutex
+}
 
-	// rotate logic, rwlock just protect fields in Cache, but not field content.
-	// So that, write lock just take a very short time, and simple read lock is
-	// just an atomic action, do not care the performance
-	select {
-	case <-c.rotate:
-		c.old = c.now
-		c.now = &sync.Map{}
-		c.barrier = &sync.Map{}
-	default:
-	}
-
-	// First: load from cache
-	if val, ok := c.now.Load(key); ok {
-		return deepcopier.Copy(val).To(dst)
-	}
-
-	// Second: load from old cache, or waitting the sigle groutine getting data
-	ch := make(chan struct{})
-	if chVal, ok := c.barrier.LoadOrStore(key, ch); ok {
-		close(ch) // the ch is not used
-
-		if val, ok := c.old.Load(key); ok {
-			return deepcopier.Copy(val).To(dst)
-		}
-
-		// type chan:  wait the sigle groutine getting data
-		// type error: already failed
-		if ch, ok = chVal.(chan struct{}); ok {
-			<-ch
-			if val, ok := c.now.Load(key); ok {
-				return deepcopier.Copy(val).To(dst)
+func (c *Cache[K, V]) Get(key K) (V, error) {
+	now := time.Now()
+	v, ok := c.syncMap.Load(key)
+	if ok {
+		e := v.(*entry[V])
+		if e.expireAt.After(now) {
+			if e.rotateAt.Before(now) {
+				go c.fulfill(key, e)
 			}
+			return e.value, e.err
 		}
-
-		val, _ := c.barrier.Load(key)
-		if err, ok := val.(error); ok {
-			return err
-		}
-
-		panic("new value lost, please report a bug")
 	}
 
-	// Third: getting data from CacheType, maybe from db
-	err := dst.Fulfill(key)
-	if err != nil {
-		c.barrier.Store(key, err)
-		return err
-	}
-
-	c.now.Store(key, dst)
-	close(ch) // broadcast, wakeup all waiting groutine
-
-	return nil
-}
-
-// Delete immediately specified the cached content to expire
-func (c *Cache) Delete(dst Data, key string) {
-	c.rwmutex.Lock()
-	defer c.rwmutex.Unlock()
-
-	c.old.Delete(key)
-	c.now.Delete(key)
-	c.barrier.Store(key, errors.New(key+" is deleted"))
-}
-
-// Rotate force refresh cached data
-func (c *Cache) Rotate(reset bool) {
-	c.rwmutex.Lock()
-	defer c.rwmutex.Unlock()
-
-	if reset {
-		c.old = &sync.Map{}
+	e := &entry[V]{}
+	if val, ok := c.syncMap.LoadOrStore(key, e); ok {
+		e = val.(*entry[V])
 	} else {
-		c.old = c.now
+		c.list.PushFront(key)
 	}
-	c.now = &sync.Map{}
-	c.barrier = &sync.Map{}
+
+	c.fulfill(key, e)
+	c.gc(now)
+	return e.value, e.err
+}
+
+func (c *Cache[K, V]) fulfill(key K, e *entry[V]) {
+	if !e.rw.TryLock() {
+		e.rw.RLock() // wait for unlock
+		e.rw.RUnlock()
+		return
+	}
+	defer e.rw.Unlock()
+
+	if e.value, e.err = c.getter(key); e.err != nil {
+		if e.value, e.err = c.getter(key); e.err != nil {
+			return
+		}
+	}
+
+	now := time.Now()
+	e.rotateAt = now.Add(c.RotateInterval)
+	e.expireAt = now.Add(c.ExpireInterval)
+
+	c.list.MoveToFront(&Element[K]{Value: key})
+}
+
+func (c *Cache[K, V]) gc(now time.Time) {
+	ele := c.list.Back()
+	if ele == nil {
+		return
+	}
+
+	if c.list.len > c.MaxEntries {
+		c.list.Remove(ele)
+		return
+	}
+
+	if val, ok := c.syncMap.Load(ele.Value); ok {
+		if val.(*entry[V]).expireAt.Before(now) {
+			c.syncMap.Delete(ele.Value)
+			c.list.Remove(ele)
+			c.gc(now)
+		}
+	}
+}
+
+func (c *Cache[K, V]) Remove(key K) {
+	c.list.Remove(&Element[K]{Value: key})
+	c.syncMap.Delete(key)
 }
