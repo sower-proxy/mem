@@ -7,7 +7,7 @@ import (
 
 type Cache[K comparable, V any] struct {
 	getter         func(key K) (V, error)
-	RotateInterval time.Duration
+	expireGetter   func(key K) (V, time.Time, error)
 	ExpireInterval time.Duration
 	MaxEntries     int
 
@@ -20,9 +20,16 @@ func NewCache[K comparable, V any](expire time.Duration,
 
 	return &Cache[K, V]{
 		getter:         getter,
-		RotateInterval: expire / 2,
 		ExpireInterval: expire,
 		MaxEntries:     1000,
+	}
+}
+func NewExpireCache[K comparable, V any](
+	getter func(key K) (V, time.Time, error)) *Cache[K, V] {
+
+	return &Cache[K, V]{
+		expireGetter: getter,
+		MaxEntries:   1000,
 	}
 }
 
@@ -41,9 +48,6 @@ func (c *Cache[K, V]) Get(key K) (V, error) {
 	if ok {
 		e := v.(*entry[V])
 		if e.expireAt.After(now) {
-			if e.rotateAt.Before(now) {
-				go c.fulfill(key, e)
-			}
 			return e.value, e.err
 		}
 	}
@@ -68,15 +72,16 @@ func (c *Cache[K, V]) fulfill(key K, e *entry[V]) {
 	}
 	defer e.rw.Unlock()
 
-	if e.value, e.err = c.getter(key); e.err != nil {
-		if e.value, e.err = c.getter(key); e.err != nil {
-			return
-		}
+	if c.expireGetter != nil {
+		e.value, e.expireAt, e.err = c.expireGetter(key)
+		return
 	}
 
-	now := time.Now()
-	e.rotateAt = now.Add(c.RotateInterval)
-	e.expireAt = now.Add(c.ExpireInterval)
+	if e.value, e.err = c.getter(key); e.err != nil {
+		return
+	}
+
+	e.expireAt = time.Now().Add(c.ExpireInterval)
 
 	c.list.MoveToFront(&Element[K]{Value: key})
 }
