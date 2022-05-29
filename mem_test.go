@@ -8,7 +8,7 @@ import (
 )
 
 func Test_Get_Succ(t *testing.T) {
-	cache := mem.NewCache(time.Second, func(key string) (string, error) {
+	cache := mem.NewRotateCache(time.Second, func(key string) (string, error) {
 		return time.Now().Format(time.StampMilli), nil
 	})
 
