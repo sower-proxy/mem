@@ -6,30 +6,30 @@ import (
 )
 
 type Cache[K comparable, V any] struct {
-	getter         func(key K) (V, error)
 	expireGetter   func(key K) (V, time.Time, error)
-	ExpireInterval time.Duration
+	getter         func(key K) (V, error)
+	rotateInterval time.Duration
 	MaxEntries     int
 
 	list    List[K]
 	syncMap sync.Map
 }
 
-func NewCache[K comparable, V any](expire time.Duration,
-	getter func(key K) (V, error)) *Cache[K, V] {
-
-	return &Cache[K, V]{
-		getter:         getter,
-		ExpireInterval: expire,
-		MaxEntries:     1000,
-	}
-}
-func NewExpireCache[K comparable, V any](
+func NewCache[K comparable, V any](
 	getter func(key K) (V, time.Time, error)) *Cache[K, V] {
 
 	return &Cache[K, V]{
 		expireGetter: getter,
 		MaxEntries:   1000,
+	}
+}
+func NewRotateCache[K comparable, V any](rotate time.Duration,
+	getter func(key K) (V, error)) *Cache[K, V] {
+
+	return &Cache[K, V]{
+		getter:         getter,
+		rotateInterval: rotate,
+		MaxEntries:     1000,
 	}
 }
 
@@ -74,16 +74,14 @@ func (c *Cache[K, V]) fulfill(key K, e *entry[V]) {
 
 	if c.expireGetter != nil {
 		e.value, e.expireAt, e.err = c.expireGetter(key)
-		return
+	} else {
+		e.value, e.err = c.getter(key)
+		e.expireAt = time.Now().Add(c.rotateInterval)
 	}
 
-	if e.value, e.err = c.getter(key); e.err != nil {
-		return
+	if e.err == nil {
+		c.list.MoveToFront(&Element[K]{Value: key})
 	}
-
-	e.expireAt = time.Now().Add(c.ExpireInterval)
-
-	c.list.MoveToFront(&Element[K]{Value: key})
 }
 
 func (c *Cache[K, V]) gc(now time.Time) {
